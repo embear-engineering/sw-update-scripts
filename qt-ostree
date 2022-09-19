@@ -1,0 +1,1082 @@
+#!/bin/bash
+#############################################################################
+##
+## Copyright (C) 2016 The Qt Company Ltd.
+## Contact: https://www.qt.io/licensing/
+##
+## This file is copied from the Qt OTA Update module of the Qt Toolkit.
+## It is sligtly modified to work with standard ostree found in Ubuntu 22.04.
+## Only the use-case for create-qt-image.sh was tested.
+##
+## $QT_BEGIN_LICENSE:GPL$
+## Commercial License Usage
+## Licensees holding valid commercial Qt licenses may use this file in
+## accordance with the commercial license agreement provided with the
+## Software or, alternatively, in accordance with the terms contained in
+## a written agreement between you and The Qt Company. For licensing terms
+## and conditions see https://www.qt.io/terms-conditions. For further
+## information use the contact form at https://www.qt.io/contact-us.
+##
+## GNU General Public License Usage
+## Alternatively, this file may be used under the terms of the GNU
+## General Public License version 3 or (at your option) any later version
+## approved by the KDE Free Qt Foundation. The licenses are as published by
+## the Free Software Foundation and appearing in the file LICENSE.GPL3
+## included in the packaging of this file. Please review the following
+## information to ensure the GNU General Public License requirements will
+## be met: https://www.gnu.org/licenses/gpl-3.0.html.
+##
+## $QT_END_LICENSE$
+##
+#############################################################################
+if [ -n "${QT_OSTREE_DEBUG}" ] ; then
+    set -x
+    VERBOSE="v"
+fi
+set -e
+shopt -s extglob
+trap handle_non_zero_exit EXIT
+
+ROOT=$(dirname $(readlink -f $0))
+WORKDIR=$PWD
+
+GENERATED_TREE=${WORKDIR}/tree
+BOOT_FILE_PATH=${GENERATED_TREE}/boot/
+SERVER_ROOT=${WORKDIR}/httpd
+CREATE_OTA_SYSROOT=false
+OTA_SYSROOT=${WORKDIR}/sysroot
+START_HTTPD=false
+INVALID_ARGS=false
+OS_NAME="qt-os"
+BOOTDIR_ON_ROOTFS=false
+DEVELOPER=true
+# INPUT SYSROOT
+INPUT_SYSROOT_ARG_COUNTER=0
+BINARY_IMAGE=false
+ARCHIVED_SYSROOT=false
+DIRTREE_SYSROOT=false
+# HARDWARE INTEGRATION
+DEVICE=""
+BOOTLOADER="u-boot"
+UBOOT_SCRIPT=""
+GRUB2_CFG_GENERATOR=""
+# REPO
+FIRST_COMMIT=false
+OSTREE_REPO=${WORKDIR}/ostree-repo
+OSTREE_BRANCH=linux/qt
+OSTREE_COMMIT_SUBJECT=""
+# STATIC DELTA
+STATIC_DELTA_ARGS=""
+SELF_CONTAINED_PACKAGE=false
+SUPERBLOCK=${WORKDIR}/superblock
+DELTA_FROM=${OSTREE_BRANCH}^
+DELTA_TO=${OSTREE_BRANCH}
+# TLS
+USE_CLIENT_TLS=false
+SERVER_CERT=""
+CLIENT_CERT=""
+CLIENT_KEY=""
+TLS_CERT_PATH=${GENERATED_TREE}/usr/share/ostree/certs/
+# GPG
+USE_GPG=false
+GPG_KEY=""
+GPG_HOMEDIR=""
+GPG_TRUSTED_KEYRING=""
+GPG_KEYS_PATH=${GENERATED_TREE}/usr/share/ostree/trusted.gpg.d/
+# DD IMAGE
+ROOTFS_TYPE="ext3"
+ROOTFS_OPT="-F -L rootfs"
+BOOTFS_TYPE="ext2"
+BOOTFS_OPT="-F -L boot-ostree"  # When /boot directory is on a separate partition from rootfs, ostree-remount attempts to mount filesystem where LABEL=boot-ostree
+BOOTFS_SIZE="65536"             # Boot partition size [in KiB]
+RECOVERY_PARTITION=false
+RECOVERYFS_TYPE="ext2"
+RECOVERYFS_OPT="-F -L recovery"
+RECOVERYFS_SIZE="65536"         # Recovery partition size [in KiB]
+ROOT_OVERHEAD_FACTOR="3"
+PARTITION_ALIGNMENT="4096"      # Set alignment to 4MB [in KiB]
+# LOG COLORS
+COLOR_DEFAULT='\e[0m'
+COLOR_RED='\e[0;31m'
+COLOR_GREEN='\e[0;32m'
+COLOR_YELLOW='\e[0;33m'
+
+qt_ostree_exit()
+{
+    # We are done, disable the trap.
+    trap - EXIT
+    exit ${1}
+}
+
+qt_ostree_info()
+{
+    echo -e ${COLOR_GREEN}[info] ${COLOR_DEFAULT}${1}
+}
+
+qt_ostree_warning()
+{
+    echo -e ${COLOR_YELLOW}[warning] ${COLOR_DEFAULT}${1}
+}
+
+qt_ostree_error()
+{
+    echo -e ${COLOR_RED}[error] ${COLOR_DEFAULT}${1}
+    echo
+    qt_ostree_exit 1
+}
+
+handle_non_zero_exit()
+{
+    qt_ostree_error "$BASH_COMMAND returned non-zero exit code. For debugging set QT_OSTREE_DEBUG environment variable."
+}
+
+print_usage_header()
+{
+    msg=${1}
+    if [ -n "$msg" ] ; then
+        echo
+        echo $msg
+    fi
+    echo
+    echo "Usage: sudo $0 OPTIONS"
+    echo
+}
+
+usage()
+{
+    if [ $DEVELOPER = true ] ; then
+        return 0
+    fi
+    print_usage_header ""
+
+    echo "OPTIONS:"
+    echo
+    echo "--sysroot-image-path FILE or DIR"
+    echo
+    echo "    A path to a linux sysroot. This argument accepts binary *.img file,"
+    echo "    *.tar.gz file or a path to an extracted sysroot."
+    echo
+    echo "--sysroot-image-path-list \"LIST\""
+    echo
+    echo "    A space separated list of absolute paths to *.tar.gz files. Use this argument"
+    echo "    when a sysroot is composed of several *.tar.gz files."
+    echo
+    echo "--initramfs FILE"
+    echo
+    echo "    OSTree boot compatible initramfs. Used also for recovery booting (see"
+    echo "    --create-recovery-partition)."
+    echo
+    echo "--uboot-env-file FILE"
+    echo
+    echo "    OSTree boot compatible u-boot environment file. If the filename is 'uEnv.txt',"
+    echo "    then it will be appended to the OSTree's managed uEnv.txt"
+    echo
+    echo "--grub2-cfg-generator FILE"
+    echo
+    echo "    GRUB2 configuration generator script."
+    echo
+    echo "--kernel-args \"ARGS\""
+    echo
+    echo "    A list of an additional kernel parameters (passed to the boot loader integration code)."
+    echo
+    echo "--kernel-version \"VERSION\""
+    echo
+    echo "    A Linux kernel file in the generated tree is renamed to vmlinuz-\${KERNEL_VERSION}."
+    echo "    When this argument is not provided, the script attempts to extract the kernel"
+    echo "    version from the original filename of the kernel, if that fails the kernel file"
+    echo "    is renamed to vmlinuz-unknown."
+    echo
+    echo "--ota-json FILE"
+    echo
+    echo "    JSON file containing an OTA update metadata."
+    echo
+    echo "--ostree-repo DIR"
+    echo
+    echo "    Commits the generated tree into this repository. If the repository does not"
+    echo "    exist, one is created in the specified location. If this argument is not"
+    echo "    provided, a default repository is created in the working directory."
+    echo
+    echo "--create-self-contained-package"
+    echo
+    echo "    Creates a self-contained (superblock) update package. This package is saved in the"
+    echo "    current working directory."
+    echo
+    echo "--disable-bsdiff"
+    echo
+    echo "    The bsdiff algorithm produces smaller updates by taking advantage of how executable"
+    echo "    files change. Smaller updates mean a better download efficiency. Applying bsdiff deltas"
+    echo "    on the client devices requires extra CPU and memory resources, as well as I/O requests."
+    echo "    When generating an update for resource-constrained devices it might be desirable"
+    echo "    to disable bsdiff."
+    echo
+
+    # NOTE: Disabling, as we don't really use them at the moment.
+    #echo "--ostree-branch os/branch-name        Commits the generated update in the specified OSTree branch. A default branch is linux/qt."
+    #echo "--ostree-commit-subject \"SUBJECT\"     Commits the generated update with the specified commit subject. A default commit subject is the"
+    #echo "                                      date and time when the update was committed."
+
+    echo "--start-trivial-httpd"
+    echo
+    echo "    Starts a simple web server, hosting the OSTree repository (see --ostree-repo)."
+    echo "    The address to the hosted repository is listed in the httpd/httpd-address"
+    echo "    file in the working directory."
+    echo
+    echo "--create-ota-sysroot"
+    echo
+    echo "    Generates bootable Over-The-Air Update enabled sysroot."
+    echo
+    echo "--create-recovery-partition"
+    echo
+    echo "    When provided, a dedicated partition is created right after the rootfs"
+    echo "    partition. It duplicates contents of /boot, this partition should be treated"
+    echo "    as read-only."
+    echo
+    echo "TLS AUTHENTICATION"
+    echo
+    echo "    The --tls-* files will be installed in ${TLS_CERT_PATH#*qt-ostree/tree}."
+    echo "    If the sysroot already has pre-installed certificates in this path, the"
+    echo "    --tls-* command line arguments can be omitted."
+    echo
+    echo "--tls-ca-path FILE"
+    echo
+    echo "    Path to file containing trusted anchors instead of the system CA database."
+    echo "    Pins the certificate and uses it for servers authentication."
+    echo
+    echo "--tls-client-cert-path FILE"
+    echo
+    echo "    Path to a file for client-side certificate, to present when making requests"
+    echo "    to a remote repository."
+    echo
+    echo "--tls-client-key-path FILE"
+    echo
+    echo "    Path to a file containing client-side certificate key, to present when making"
+    echo "    requests to a remote repository."
+    echo
+    echo "GPG SIGNING"
+    echo
+    echo "--gpg-sign KEY-ID"
+    echo
+    echo "    GPG Key ID to use for signing the commit."
+    echo
+    echo "--gpg-homedir DIR"
+    echo
+    echo "    GPG home directory to use when looking for keyrings."
+    echo
+    echo "--gpg-trusted-keyring FILE"
+    echo
+    echo "    Adds the provided keyring file to the generated sysroot (see --create-ota-sysroot)"
+    echo "    or to the generated update. When providing a new keyring via update, the"
+    echo "    new keyring will be used for signature verification only after this update"
+    echo "    has been applied. GPG keyring will be installed in:"
+    echo "    ${GPG_KEYS_PATH#*qt-ostree/tree}."
+    echo
+}
+
+validation_error()
+{
+    error_message=${1}
+
+    if [ $INVALID_ARGS = false ] ; then
+        echo
+        echo "Following validation errors occurred:"
+        echo
+    fi
+    INVALID_ARGS=true
+
+    echo "error: ${error_message}"
+}
+
+validate_arg()
+{
+    arg=${1}
+    value=${2}
+    required=${3}
+    flag=${4}
+
+    if [ -z "${value}" ] ; then
+        if [ ${required} = true ] ; then
+            validation_error "${arg} is not set."
+        fi
+        return 0
+    fi
+
+    if [ -n "${flag}" ] && [ ! -${flag} ${value} ] ; then
+        case ${flag} in
+            d)
+                validation_error "${arg} requires a directory path, but ${value} was provided."
+                ;;
+            f)
+                validation_error "${arg} requires a path to a file, but ${value} was provided."
+                ;;
+            e)
+                validation_error "${arg} ${value} is not pointing to an existing file or directory."
+                ;;
+        esac
+        return 0
+    fi
+
+    case ${arg} in
+        --gpg-trusted-keyring)
+            if [[ ${GPG_TRUSTED_KEYRING} != *.gpg ]] ; then
+                validation_error "--gpg-trusted-keyring expects gpg keyring file with the .gpg extension, but ${GPG_TRUSTED_KEYRING} was provided."
+            fi
+            ;;
+        --sysroot-image-path)
+            INPUT_SYSROOT_ARG_COUNTER=$(( $INPUT_SYSROOT_ARG_COUNTER + 1 ))
+            if [ -d "${SYSROOT_IMAGE_PATH}" ] ; then
+                if [[ ! -e "${SYSROOT_IMAGE_PATH}/usr" || ! -e "${SYSROOT_IMAGE_PATH}/bin" ]] ; then
+                    validation_error "--sysroot-image-path ${SYSROOT_IMAGE_PATH} does not seem to point to an linux sysroot."
+                fi
+                DIRTREE_SYSROOT=true
+            elif [ -f "${SYSROOT_IMAGE_PATH}" ] ; then
+                if [[ ${SYSROOT_IMAGE_PATH} = *.img ]] ; then
+                    BINARY_IMAGE=true
+                elif [[ ${SYSROOT_IMAGE_PATH} = *.tar.gz ]] ; then
+                    ARCHIVED_SYSROOT=true
+                fi
+            fi
+            ;;
+        --sysroot-image-path-list)
+            INPUT_SYSROOT_ARG_COUNTER=$(( $INPUT_SYSROOT_ARG_COUNTER + 1 ))
+            ARCHIVED_SYSROOT=true
+            SYSROOT_IMAGE_PATH="${SYSROOT_IMAGE_PATH_LIST}"
+            for archive in ${SYSROOT_IMAGE_PATH} ; do
+                if [[ "${archive}" != /* || "${archive}" != *.tar.gz || ! -e "${archive}" ]] ; then
+                    validation_error "--sysroot-image-path-list expects list of absolute paths to an existing *.tar.gz files, but \"${SYSROOT_IMAGE_PATH_LIST}\" was provided."
+                    break
+                fi
+            done
+            ;;
+    esac
+}
+
+parse_args()
+{
+    while [ $# -gt 0 ] ; do
+        case "${1}" in
+          --create-ota-sysroot)
+              CREATE_OTA_SYSROOT=true
+              ;;
+          --create-recovery-partition)
+              RECOVERY_PARTITION=true
+              ;;
+          --start-trivial-httpd)
+              START_HTTPD=true
+              ;;
+          --ostree-repo)
+              OSTREE_REPO=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --create-self-contained-package)
+              SELF_CONTAINED_PACKAGE=true
+              ;;
+          --disable-bsdiff)
+              STATIC_DELTA_ARGS="--disable-bsdiff"
+              ;;
+          --uboot-script)
+              UBOOT_SCRIPT=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --grub2-cfg-generator)
+              GRUB2_CFG_GENERATOR=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --kernel-args)
+              KERNEL_ARGS="${2}"
+              shift 1
+              ;;
+          --kernel-version)
+              KERNEL_VERSION="${2}"
+              shift 1
+              ;;
+          --ota-json)
+              OTA_JSON=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --tls-ca-path)
+              SERVER_CERT=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --tls-client-cert-path)
+              CLIENT_CERT=$(realpath -ms ${2})
+              USE_CLIENT_TLS=true
+              shift 1
+              ;;
+          --tls-client-key-path)
+              CLIENT_KEY=$(realpath -ms ${2})
+              USE_CLIENT_TLS=true
+              shift 1
+              ;;
+          --ostree-branch)
+              OSTREE_BRANCH=${2}
+              shift 1
+              ;;
+          --ostree-commit-subject)
+              OSTREE_COMMIT_SUBJECT=${2}
+              shift 1
+              ;;
+          --sysroot-image-path)
+              SYSROOT_IMAGE_PATH=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --sysroot-image-path-list)
+              SYSROOT_IMAGE_PATH_LIST=${2}
+              shift 1
+              ;;
+          --initramfs)
+              INITRAMFS=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --devicetree)
+              DEVICETREE=${2}
+              shift 1
+              ;;
+          --gpg-sign)
+              GPG_KEY=${2}
+              USE_GPG=true
+              shift 1
+              ;;
+          --gpg-homedir)
+              GPG_HOMEDIR=$(realpath -ms ${2})
+              USE_GPG=true
+              shift 1
+              ;;
+          --gpg-trusted-keyring)
+              GPG_TRUSTED_KEYRING=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --ostree) # intentionally undocumented
+              OSTREE=$(realpath -ms ${2})
+              shift 1
+              ;;
+          --developer) # intentionally undocumented
+              DEVELOPER=true
+              ;;
+          -h | -help | --help)
+              usage
+              qt_ostree_exit 0
+              ;;
+          -*)
+              validation_error "Unknown parameter: ${1}"
+              usage
+              qt_ostree_exit 1
+              ;;
+        esac
+        shift 1
+    done
+
+    # Check if running as root.
+    if [ $(id -u) -ne 0 ]; then
+        print_usage_header "You need root privileges to run this script."
+        qt_ostree_exit 1
+    fi
+
+    # Check for OSTree dependency.
+    validate_arg "--ostree" "${OSTREE}" false f
+    if [ -z "${OSTREE}" ] ; then
+        OSTREE=$(readlink -m "${ROOT}"/ostree)
+    fi
+    if [ ! -x "${OSTREE}" ] ; then
+        OSTREE="/usr/bin/ostree"
+    fi
+
+    validate_arg "--sysroot-image-path" "${SYSROOT_IMAGE_PATH}" false e
+    validate_arg "--sysroot-image-path-list" "${SYSROOT_IMAGE_PATH_LIST}" false
+    case ${INPUT_SYSROOT_ARG_COUNTER} in
+      0) validation_error "--sysroot-image-path or --sysroot-image-path-list is required." ;;
+      2) validation_error "--sysroot-image-path and --sysroot-image-path-list are mutually exclusive." ;;
+    esac
+
+    validate_arg "--initramfs" "${INITRAMFS}" false f
+    validate_arg "--uboot-env-file" "${UBOOT_SCRIPT}" false f
+    validate_arg "--grub2-cfg-generator" "${GRUB2_CFG_GENERATOR}" false f
+    validate_arg "--ota-json" "${OTA_JSON}" true f
+    validate_arg "--gpg-homedir" "${GPG_HOMEDIR}" false d
+    validate_arg "--gpg-trusted-keyring" "${GPG_TRUSTED_KEYRING}" false f
+    if [[ $USE_GPG = true && ( -z "${GPG_KEY}" || -z "${GPG_HOMEDIR}" ) ]] ; then
+        # Note: --gpg-homedir is not required when keyring is stored in a standard path,
+        # but just to be sure that a commit won't fail, we require both of these args.
+        validation_error "Must specify both --gpg-sign and --gpg-homedir for GPG signing feature."
+    fi
+
+    validate_arg "--tls-ca-path" "${SERVER_CERT}" false f
+    validate_arg "--tls-client-cert-path" "${CLIENT_CERT}" false f
+    validate_arg "--tls-client-key-path" "${CLIENT_KEY}" false f
+    if [[ $USE_CLIENT_TLS = true && ( -z "${CLIENT_CERT}" || -z "${CLIENT_KEY}" ) ]] ; then
+        validation_error "Must specify both --tls-client-cert-path and --tls-client-key-path for TLS client authentication feature."
+    fi
+
+    if [ ! -d ${OSTREE_REPO}/objects ] ; then
+        FIRST_COMMIT=true
+    fi
+    if [[ $FIRST_COMMIT = true && $SELF_CONTAINED_PACKAGE = true ]] ; then
+        validation_error "Can not generate a self-contained package (--create-self-contained-package), when --ostree-repo points to a non-existing repository."
+    fi
+
+    if [ $INVALID_ARGS = true ] ; then
+        usage
+        qt_ostree_exit 1
+    fi
+    # Report.
+    qt_ostree_info "Using ostree ${OSTREE}"
+    qt_ostree_info "OTA JSON: " && echo "$(cat ${OTA_JSON})"
+}
+
+umount_mount_points()
+{
+    cd ${WORKDIR}/
+
+    dir_list="boot-mount rootfs-mount boot-dd rootfs-dd recovery-dd"
+    did_umount=false
+    for dir in $dir_list ; do
+        if mountpoint -q ${dir} ; then
+            did_umount=true
+            umount ${dir}
+        fi
+        rm -rf ${dir}
+    done
+
+    if [ ${did_umount} = true ] ; then
+        sync
+    fi
+}
+
+clean_workdir()
+{
+    cd ${WORKDIR}/
+
+    # Remove immutable attribute.
+    chattr -if ${OTA_SYSROOT}/ostree/deploy/*/deploy/* || true
+    rm -rf ${OTA_SYSROOT}
+    rm -rf ${GENERATED_TREE}
+}
+
+find_in_sysroot()
+{
+    target=${1}
+    target_path=$(find ${GENERATED_TREE} -type f -name ${target})
+    if [ -z "${target_path}" ] ; then
+        qt_ostree_error "Failed to find \"${target}\" in the provided sysroot"
+    fi
+}
+
+# Doc: call find_in_sysroot() before using path_in_sysroot(). Combining these
+# two functions would result in executing handle_non_zero_exit() when a target
+# file is not found. And instead of getting a normal error message we would also
+# get an error message from handle_non_zero_exit(), when using the "combined"
+# version within command substitutions: path=$(find_in_sysroot "some-file").
+path_in_sysroot()
+{
+    target=${1}
+    target_path=$(find ${GENERATED_TREE} -type f -name ${target})
+    echo ${target_path}
+}
+
+get_kernel_info()
+{
+    # Find kernel image.
+    # Note: It might be a good idea to expose KERNEL as command line argument, when
+    # the existing search algorithm is not sufficient.
+#    cd ${BOOT_FILE_PATH}/
+#    for boot_file in *; do
+#        if file -b ${boot_file} | grep -qi "kernel"; then
+#            KERNEL=${BOOT_FILE_PATH}/${boot_file}
+#            break
+#        fi
+#    done
+#    if [ -z "${KERNEL}" ] ; then
+#        qt_ostree_error "Failed to find kernel image in ${BOOT_FILE_PATH}"
+#    fi
+    KERNEL=$(readlink -f ${BOOT_FILE_PATH}/Image.gz)
+    qt_ostree_info "Using kernel image ${KERNEL}"
+
+    # Extract kernel version from a filename.
+    if [ -z "${KERNEL_VERSION}" ] ; then
+        KERNEL_VERSION=$(basename "${KERNEL}" | sed "s/.*Image\.gz-//")
+        if [ -z "${KERNEL_VERSION}" ] ; then
+            qt_ostree_warning "${KERNEL} filename does not contain kernel version. The kernel version can be
+                               provided with the --kernel-version command line argument."
+            KERNEL_VERSION="unknown"
+        fi
+    fi
+
+    qt_ostree_info "Kernel version: ${KERNEL_VERSION}"
+}
+
+organize_boot_files()
+{
+    get_kernel_info
+
+    # Clean up from broken symbolic links.
+    find -L ${BOOT_FILE_PATH}/ -type l -delete
+
+    cp ${KERNEL} ${GENERATED_TREE}/lib/modules/${KERNEL_VERSION}/vmlinuz
+    mkdir -p ${GENERATED_TREE}/lib/modules/${KERNEL_VERSION}/dtb
+    mv ${BOOT_FILE_PATH}/*.dtb ${GENERATED_TREE}/usr/lib/modules/${KERNEL_VERSION}/dtb/
+    mv ${BOOT_FILE_PATH}/overlays.txt ${GENERATED_TREE}/usr/lib/modules/${KERNEL_VERSION}/dtb/
+    mv ${BOOT_FILE_PATH}/devicetree ${GENERATED_TREE}/usr/lib/modules/${KERNEL_VERSION}/dtb/overlays
+    rm ${BOOT_FILE_PATH}/Image.gz
+    rm ${BOOT_FILE_PATH}/boot.scr
+
+    touch ${BOOT_FILE_PATH}/.ostree-bootcsumdir-source
+
+#     # NOTE: This file is used by higher level API.
+#    touch ${BOOT_FILE_PATH}/kargs
+#    if [ -n "${KERNEL_ARGS}" ] ; then
+#        qt_ostree_info "Additional kernel command line arguments: $KERNEL_ARGS"
+#        for karg in ${KERNEL_ARGS} ; do
+#            kargs="${kargs} --karg=$karg"
+#        done
+#        echo $kargs > ${BOOT_FILE_PATH}/kargs
+#    fi
+}
+
+adjust_sysroot_layout()
+{
+    # Adjust rootfs according to OSTree guidelines.
+    cd ${GENERATED_TREE}
+    mkdir -p sysroot/ostree/
+    ln -s sysroot/ostree/ ostree
+    mkdir -p sysroot/tmp/
+    rm -rf tmp/
+    ln -s sysroot/tmp/ tmp
+    # The sysroot should not have a traditional UNIX /etc; instead, it should include /usr/etc.
+    if [ -e etc/ ] ; then
+        mv etc/ usr/
+    fi
+    # It's recommended that operating systems ship all of their content in /usr.
+    # NOTE: $usr_move and $var_symlinks could be configurable via command line arguments.
+    #usr_move="bin lib sbin data"
+    #mkdir -p usr/system/
+    #for dir in $usr_move ; do
+    #    if [ -d ${dir} ] ; then
+    #        mv ${dir} usr/system/
+    #        ln -s usr/system/${dir} ${dir}
+    #    fi
+    #done
+    # Everything in /var is preserved across upgrades. Add symlinks so that paths from
+    # ${var_symlinks} point into /var. OSTree by design does not update contents in /var.
+    # It is OS responsibily to handle /var. OS can run post-upgrade scripts to copy the
+    # updates files to /var if required.
+    var_symlinks="home mnt media opt"
+    for dir in $var_symlinks ; do
+        if [ -d ${dir} ] ; then
+            if [ -z "$(find ${dir} -type f)" ]; then
+                rm -rf ${dir}
+            else
+                ro_paths=$(sed 's/ /, /g' <<< ${usr_move})
+                qt_ostree_warning "Found some contents in: /${dir}. It is recommended that operating system ships all
+                                   \nof its contents in /usr or in one of the following top level directories: [$ro_paths].
+                                   \n/${dir} will be a part of an update, but it won't be protected by the /usr read-only mount
+                                   \nset by default. Any changes users will do in this directory WILL BE LOST ON THE NEXT UPGRADE"
+                continue
+            fi
+            mkdir -p var/${dir}
+            ln -s var/${dir} ${dir}
+        fi
+    done
+}
+
+convert_to_ostree_sysroot()
+{
+    cd ${GENERATED_TREE}
+    find_in_sysroot "ostree"
+    find_in_sysroot "ostree-remount"
+
+    organize_boot_files
+
+    # OSTree requires /etc/os-release file (see The Boot Loader Specification).
+    if [ ! -e ${GENERATED_TREE}/etc/os-release ] ; then
+        echo "PRETTY_NAME=\"${OS_NAME}\"" > ${GENERATED_TREE}/etc/os-release
+    fi
+
+    init_system=$(basename $(readlink -f ${GENERATED_TREE}/sbin/init))
+    if [ "$init_system" != "systemd" ] ; then
+        qt_ostree_error "Failed to detected systemd init support on the image"
+    fi
+
+    adjust_sysroot_layout
+
+    # OTA metadata.
+    cp ${OTA_JSON} ${GENERATED_TREE}/usr/etc/qt-ota.json
+
+    # Add trusted GPG keyring file.
+    if [ -n "${GPG_TRUSTED_KEYRING}" ] ; then
+        cp ${GPG_TRUSTED_KEYRING} ${GPG_KEYS_PATH}
+    fi
+
+    # Enable TLS support.
+    mkdir -p ${TLS_CERT_PATH}
+    if [ -n "${SERVER_CERT}" ] ; then
+        cp ${SERVER_CERT} ${TLS_CERT_PATH}
+    fi
+    if [ $USE_CLIENT_TLS = true ] ; then
+        cp ${CLIENT_CERT} ${CLIENT_KEY} ${TLS_CERT_PATH}
+    fi
+}
+
+create_self_contained_package()
+{
+    qt_ostree_info "Generating a self-contained update package ..."
+    # Disable fallback objects, so all objects would be included in the generated
+    # delta and applying the delta would not require an Internet connection.
+    "${OSTREE}" --repo=${OSTREE_REPO} static-delta generate  ${STATIC_DELTA_ARGS} \
+                --min-fallback-size=0 --inline --filename=${SUPERBLOCK}
+
+    if [ ! -e "${SUPERBLOCK}" ] ; then
+        qt_ostree_error "Something failed, ${SUPERBLOCK} does not exist"
+    fi
+    qt_ostree_info "Generated a self-contained update package: ${SUPERBLOCK}"
+}
+
+commit_generated_tree()
+{
+    # Commit the generated tree into OSTree repository.
+    if [ $FIRST_COMMIT = true ] ; then
+        mkdir -p ${OSTREE_REPO}
+        qt_ostree_info "Initializing new OSTree repository in ${OSTREE_REPO}"
+        "${OSTREE}" --repo=${OSTREE_REPO} init --mode=archive-z2
+    fi
+
+    if [ -z "${OSTREE_COMMIT_SUBJECT}" ] ; then
+        current_time=$(date +"%m-%d-%Y %T")
+        OSTREE_COMMIT_SUBJECT="Generated commit subject: ${current_time}"
+    fi
+    if [ $USE_GPG = true ] ; then
+        GPG_ARGS="--gpg-sign=${GPG_KEY} --gpg-homedir=${GPG_HOMEDIR}"
+    fi
+
+    if [ $FIRST_COMMIT = false ] ; then
+        prev_rev=$("${OSTREE}" --repo=${OSTREE_REPO} rev-parse ${OSTREE_BRANCH})
+    fi
+    qt_ostree_info "Committing the generated tree into a repository at ${OSTREE_REPO} ..."
+    "${OSTREE}" --repo=${OSTREE_REPO} commit \
+                --tree=dir=${GENERATED_TREE} \
+                -b ${OSTREE_BRANCH} -s "${OSTREE_COMMIT_SUBJECT}" \
+                --skip-if-unchanged \
+                ${GPG_ARGS} \
+                --owner-uid=0 --owner-gid=0
+    new_rev=$("${OSTREE}" --repo=${OSTREE_REPO} rev-parse ${OSTREE_BRANCH})
+    if [[ $FIRST_COMMIT = false && ${prev_rev} = ${new_rev} ]] ; then
+        qt_ostree_info "There are no new changes in the sysroot. A self contained package won't be generated"
+        return
+    fi
+
+    STATIC_DELTA_ARGS="${STATIC_DELTA_ARGS} --from=${DELTA_FROM} --to=${DELTA_TO}"
+    if [ $SELF_CONTAINED_PACKAGE = true ] ; then
+        create_self_contained_package
+    fi
+    # Pulling static deltas via HTTP is on hold due to several UX issues: https://github.com/ostreedev/ostree/issues/475
+    # if [ $FIRST_COMMIT = false ] ; then
+    #     qt_ostree_info "Generating static delta  ..."
+    #     "${OSTREE}" --repo=${OSTREE_REPO} static-delta generate ${STATIC_DELTA_ARGS}
+    # fi
+
+    "${OSTREE}" --repo=${OSTREE_REPO} summary -u ${GPG_ARGS}
+
+    qt_ostree_info "Checking the repository for consistency ..."
+    if [ $DEVELOPER = false ] ; then
+        "${OSTREE}" --repo=${OSTREE_REPO} fsck
+    fi
+}
+
+configure_boot_loader()
+{
+    qt_ostree_info "Configuring ${BOOTLOADER} boot loader"
+
+    if [ "${BOOTLOADER}" = "u-boot" ] ; then
+        mkdir -p ${OTA_SYSROOT}/boot/loader.0/
+        ln -s loader.0 ${OTA_SYSROOT}/boot/loader
+        touch ${OTA_SYSROOT}/boot/loader/uEnv.txt
+        ln -s loader/uEnv.txt ${OTA_SYSROOT}/boot/uEnv.txt
+        # Add convenience symlinks, for details see ostree/src/libostree/ostree-bootloader-uboot.c
+        for file in ${BOOT_FILE_PATH}/* ; do
+            name=$(basename $file)
+            if [[ ! -f $file || $name == *.dtb || $name == initramfs-* || $name == vmlinuz-* ]] ; then
+                continue
+            fi
+            ln -sf loader/${name} ${OTA_SYSROOT}/boot/${name}
+        done
+    elif [ "${BOOTLOADER}" = "grub2" ] ; then
+        mkdir -p ${OTA_SYSROOT}/boot/grub2/
+        ln -s ../loader/grub.cfg ${OTA_SYSROOT}/boot/grub2/grub.cfg
+        export OSTREE_GRUB2_EXEC=${GRUB2_CFG_GENERATOR}
+    fi
+}
+
+populate_filesystem_images()
+{
+    mkdir rootfs-dd boot-dd
+    mount boot.${BOOTFS_TYPE} boot-dd/
+    mount rootfs.${ROOTFS_TYPE} rootfs-dd/
+
+    if [ $BOOTDIR_ON_ROOTFS = true ]; then
+        # The whole sysroot on the same partition.
+        cp -rP --preserve=all ${OTA_SYSROOT}/* rootfs-dd/
+    else
+        # boot/ directory on a separate boot partition.
+        cp -rP --preserve=all ${OTA_SYSROOT}/!(boot) rootfs-dd/
+        cp -rP --preserve=all ${OTA_SYSROOT}/boot/* boot-dd/
+    fi
+
+    case "${DEVICE}" in
+        *intel-corei7*|*nuc*)
+            mcopy -s -i boot.${BOOTFS_TYPE} ${BOOT_FILE_PATH}/EFI ::/EFI
+            ;;
+    esac
+
+    if [ $RECOVERY_PARTITION = true ] ; then
+        mkdir recovery-dd
+        mount recovery.${RECOVERYFS_TYPE} recovery-dd/
+        cp -rf ${BOOT_FILE_PATH}/* recovery-dd/
+        cd recovery-dd
+        ln -s vmlinuz-* vmlinuz
+        if [ -n "${INITRAMFS}" ] ; then
+            ln -s initramfs-* initramfs
+        fi
+        cd -
+    fi
+
+    # When mounting a loopback, the kernel doesn't know that the backing device
+    # is a file on the same media. Do an explicit sync call.
+    sync
+    umount_mount_points
+}
+
+# Disk layout:
+#
+#    0                      -> PARTITION_ALIGNMENT       - reserved to boot loader      (not partitioned)
+#    PARTITION_ALIGNMENT    -> bootfs_size_aligned       - kernel and other data        (boot partition)
+#    bootfs_size_aligned    -> rootfs_size_aligned       - rootfs                       (rootfs partition)
+#    rootfs_size_aligned    -> recoveryfs_size_aligned   - recovery initramfs + kernel  (optional recovery partition)
+#
+#  --------------------- --------------------- --------------------- ------------------------- ---------------------
+# | PARTITION_ALIGNMENT | bootfs_size_aligned | rootfs_size_aligned | recoveryfs_size_aligned | PARTITION_ALIGNMENT |
+#  --------------------- --------------------- --------------------- ------------------------- ---------------------
+
+get_aligned_size()
+{
+    size=${1}
+    aligned_size=$(( ${size} + ${PARTITION_ALIGNMENT} - 1 ))
+    aligned_size=$(( ${aligned_size} - ${aligned_size} % ${PARTITION_ALIGNMENT} ))
+    echo ${aligned_size}
+}
+
+assemble_dd_image()
+{
+    cd ${WORKDIR}
+    qt_ostree_info "Assembling a deployable image ..."
+    # Align partition sizes and calculate total binary image size.
+    sysroot_size=$(du -sk ${OTA_SYSROOT}/ | cut -f1)
+    rootfs_size=$(echo ${sysroot_size}*${ROOT_OVERHEAD_FACTOR} | bc | cut -f1 -d'.')
+    bootfs_size_aligned=$(get_aligned_size ${BOOTFS_SIZE})
+    rootfs_size_aligned=$(get_aligned_size ${rootfs_size})
+    image_size=$(( ${PARTITION_ALIGNMENT} + ${bootfs_size_aligned} + ${rootfs_size_aligned} + ${PARTITION_ALIGNMENT} ))
+    if [ $RECOVERY_PARTITION = true ] ; then
+        recoveryfs_size_aligned=$(get_aligned_size ${RECOVERYFS_SIZE})
+        image_size=$(( ${image_size} + ${recoveryfs_size_aligned} ))
+    fi
+
+    # Initialize a sparse file.
+    image="${DEVICE}-ota.img"
+    rm -f ${image}
+    dd if=/dev/zero of=${image} bs=1k count=0 seek=${image_size}
+
+    # Create a partition table.
+    bootfs_start=${PARTITION_ALIGNMENT}
+    bootfs_end=$(( ${PARTITION_ALIGNMENT} + ${bootfs_size_aligned} ))
+    rootfs_end=$(( ${bootfs_end} + ${rootfs_size_aligned} ))
+    if [ "${BOOTFS_TYPE}" = "vfat" ] ; then
+        fs_type="FAT32"
+    fi
+
+    parted -s ${image} mklabel msdos
+    parted -s ${image} unit KiB mkpart primary ${fs_type} ${bootfs_start} ${bootfs_end}
+    parted -s ${image} unit KiB mkpart primary ${bootfs_end} ${rootfs_end}
+    if [ $RECOVERY_PARTITION = true ] ; then
+        recoveryfs_end=$(( ${rootfs_end} + ${recoveryfs_size_aligned} ))
+        parted -s ${image} unit KiB mkpart primary ${rootfs_end} ${recoveryfs_end}
+    fi
+    parted -s ${image} set 1 boot on
+    parted ${image} print
+
+    # Create filesystem images.
+    rm -f rootfs.${ROOTFS_TYPE} boot.${BOOTFS_TYPE} recovery.${RECOVERYFS_TYPE}
+    dd if=/dev/zero of=boot.${BOOTFS_TYPE} seek=${bootfs_size_aligned} count=0 bs=1k
+    mkfs.${BOOTFS_TYPE} ${BOOTFS_OPT} boot.${BOOTFS_TYPE}
+    dd if=/dev/zero of=rootfs.${ROOTFS_TYPE} seek=${rootfs_size_aligned} count=0 bs=1k
+    mkfs.${ROOTFS_TYPE} ${ROOTFS_OPT} rootfs.${ROOTFS_TYPE}
+    if [ $RECOVERY_PARTITION = true ] ; then
+        dd if=/dev/zero of=recovery.${RECOVERYFS_TYPE} seek=${recoveryfs_size_aligned} count=0 bs=1k
+        mkfs.${RECOVERYFS_TYPE} ${RECOVERYFS_OPT} recovery.${RECOVERYFS_TYPE}
+    fi
+
+    populate_filesystem_images
+
+    # Burn partitions.
+    dd if=boot.${BOOTFS_TYPE} of=${image} conv=notrunc seek=${bootfs_start} bs=1k
+    dd if=rootfs.${ROOTFS_TYPE} of=${image} conv=notrunc seek=${bootfs_end} bs=1k
+    if [ $RECOVERY_PARTITION = true ] ; then
+        dd if=recovery.${RECOVERYFS_TYPE} of=${image} conv=notrunc seek=${rootfs_end} bs=1k
+    fi
+    sync
+
+    qt_ostree_info "Created a binary image - ${image}, deployable with the dd command" \
+    && echo "Example dd command: sudo dd bs=4M if=${image} of=/dev/sdX && sync"
+}
+
+create_ota_sysroot()
+{
+    qt_ostree_info "Creating OTA enabled sysroot ..."
+    cd ${WORKDIR}
+
+    mkdir -p ${OTA_SYSROOT}/sysroot/
+    export OSTREE_SYSROOT=${OTA_SYSROOT}
+    "${OSTREE}" admin init-fs ${OTA_SYSROOT}
+    "${OSTREE}" admin os-init ${OS_NAME}
+
+    configure_boot_loader
+
+    qt_ostree_info "Checking out filesystem tree from ${OSTREE_REPO} repository"
+    "${OSTREE}" --repo=${OTA_SYSROOT}/ostree/repo pull-local --remote=${OS_NAME} ${OSTREE_REPO} ${OSTREE_BRANCH}
+
+    if [ -e "${BOOT_FILE_PATH}"/kargs ] ; then
+        "${OSTREE}" admin deploy $(cat "${BOOT_FILE_PATH}"/kargs) --os=${OS_NAME} ${OS_NAME}:${OSTREE_BRANCH}
+    else
+        "${OSTREE}" admin deploy --os=${OS_NAME} ${OS_NAME}:${OSTREE_BRANCH}
+    fi
+
+    if [ -n "${UBOOT_SCRIPT}" ]; then
+        mkimage -A arm64 -T script -C none -d boot.script ${OTA_SYSROOT}/boot.scr
+    fi
+
+    "${OSTREE}" admin status
+
+    # OSTree does not touch the contents of /var, it is the OS responsibility to manage this directory.
+    rm -rf ${OTA_SYSROOT}/ostree/deploy/${OS_NAME}/var/
+    cp -rd ${GENERATED_TREE}/var/ ${OTA_SYSROOT}/ostree/deploy/${OS_NAME}/
+
+    # assemble_dd_image
+}
+
+extract_sysroot()
+{
+    mkdir ${GENERATED_TREE}/
+    mkdir -p ${BOOT_FILE_PATH}/
+
+    if [ $BINARY_IMAGE = true ] ; then
+        # Extract binary image.
+        image=${SYSROOT_IMAGE_PATH}
+        qt_ostree_info "Extracting ${image} ..."
+        units=$(fdisk -l ${image} | grep Units | awk '{print $(NF-1)}')
+        # The boot partition not always is marked properly.
+        boot_start=$(fdisk -l ${image} | grep ${image}1 | awk '{print $2}')
+        if [ "${boot_start}" == "*" ] ; then
+            boot_start=$(fdisk -l ${image} | grep ${image}1 | awk '{print $3}')
+        fi
+        rootfs_start=$(fdisk -l ${image} | grep ${image}2 | awk '{print $2}')
+        boot_offset=$(( ${units} * ${boot_start} ))
+        rootfs_offset=$(( ${units} * ${rootfs_start} ))
+
+        cd ${WORKDIR}/
+        mkdir boot-mount rootfs-mount
+        mount -o loop,offset=${boot_offset} ${image} boot-mount/
+        mount -o loop,offset=${rootfs_offset} ${image} rootfs-mount/
+        cp -rp${VERBOSE}d boot-mount/* ${BOOT_FILE_PATH}
+        cp -rp${VERBOSE}d rootfs-mount/* ${GENERATED_TREE}
+    elif [ $ARCHIVED_SYSROOT = true ] ; then
+        # Extract *.tar.gz image files.
+        for image in ${SYSROOT_IMAGE_PATH} ; do
+            qt_ostree_info "Extracting ${image} ..."
+            if [[ $(basename ${image}) == *boot* ]] ; then
+                tar --preserve-permissions -C ${BOOT_FILE_PATH} -x${VERBOSE}f ${image}
+            else
+                tar --preserve-permissions -C ${GENERATED_TREE} -x${VERBOSE}f ${image}
+            fi
+        done
+    elif [ $DIRTREE_SYSROOT = true ] ; then
+        image=${SYSROOT_IMAGE_PATH}
+        qt_ostree_info "Copying ${image} ..."
+        cp -rp${VERBOSE}d ${image}/* ${GENERATED_TREE}
+    else
+        qt_ostree_error "Failed to extract ${SYSROOT_IMAGE_PATH}"
+    fi
+}
+
+start_httpd_server()
+{
+    # Start a trivial httpd server on localhost.
+    qt_ostree_info "Starting a local HTTP server"
+    rm -rf ${SERVER_ROOT}
+    mkdir ${SERVER_ROOT}
+    cd ${SERVER_ROOT}
+    ln -s ${OSTREE_REPO} ostree
+    "${OSTREE}" trivial-httpd --autoexit --daemonize -p ${SERVER_ROOT}/httpd-port
+    PORT=$(cat ${SERVER_ROOT}/httpd-port)
+    echo "http://127.0.0.1:${PORT}/ostree" > ${SERVER_ROOT}/httpd-address
+    qt_ostree_info "OTA update repository available at $(cat ${SERVER_ROOT}/httpd-address)"
+}
+
+detect_target_device()
+{
+    hostname_file=${GENERATED_TREE}/etc/hostname
+    DEVICE=$(cat ${hostname_file})
+    if [ -z "${DEVICE}" ] ; then
+        qt_ostree_error "No hostname specified in ${hostname_file}"
+    fi
+
+    case "${DEVICE}" in
+        # Intel NUC requires a special handling as it is quite different from
+        # other meta-boot2qt reference devices.
+        *intel-corei7*|*nuc*)
+            BOOTLOADER="grub2"
+            BOOTFS_TYPE="vfat"
+            BOOTFS_OPT="-n boot"
+            BOOTDIR_ON_ROOTFS=true
+            ;;
+    esac
+
+    qt_ostree_info "Detected ${DEVICE} device with ${BOOTLOADER} boot loader"
+}
+
+print_summary()
+{
+    # Print sysroot diff.
+    if [ $FIRST_COMMIT = false ] ; then
+        qt_ostree_info "Files (C)hanged / (M)odified / (D)eleted since the previous version:"
+        "${OSTREE}" --repo=${OSTREE_REPO} diff ${OSTREE_BRANCH}^ ${OSTREE_BRANCH}
+    fi
+}
+
+main()
+{
+    parse_args "$@"
+
+    umount_mount_points
+    clean_workdir
+
+    extract_sysroot
+    detect_target_device
+
+    convert_to_ostree_sysroot
+    commit_generated_tree
+
+    if [ $CREATE_OTA_SYSROOT = true ] ; then
+        create_ota_sysroot
+    fi
+
+    if [ $START_HTTPD = true ] ; then
+        start_httpd_server
+    fi
+
+    umount_mount_points
+    if [ $DEVELOPER = false ] ; then
+        clean_workdir
+    fi
+
+    print_summary
+    qt_ostree_info "All done."
+    qt_ostree_exit 0
+}
+
+main "$@"

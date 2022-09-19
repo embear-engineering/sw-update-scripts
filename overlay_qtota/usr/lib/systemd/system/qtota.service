@@ -1,0 +1,9 @@
+[Unit]
+Description=Qt OTA Client
+
+[Service]
+ExecStart=/usr/bin/qtota
+EnvironmentFile=/etc/environment
+
+[Install]
+WantedBy=multi-user.target

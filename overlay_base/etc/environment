@@ -1,0 +1,10 @@
+#
+# This file is parsed by pam_env module
+#
+# Syntax: simple "KEY=VAL" pairs on separate lines
+#
+
+XDG_RUNTIME_DIR=/tmp
+QT_QPA_EGLFS_KMS_CONFIG=/etc/kms.conf
+QT_LOGGING_RULES=qt.qpa.*=true
+
